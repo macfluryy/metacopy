@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""metacopy — переносит метаданные с исходной фотографии на обработанную картинку.
+
+Типичный сценарий: снимок с iPhone (HEIC/JPEG) прогнали через ИИ, на выходе
+PNG/JPEG/WEBP без EXIF. metacopy возвращает картинке дату съёмки, GPS, камеру,
+объектив и Apple MakerNotes, чтобы Фото поставили её на правильное место в медиатеке.
+
+Зависимости: exiftool (brew install exiftool). Для конвертации используется sips
+из macOS, а если его нет — Pillow.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+__version__ = "1.0.0"
+PROG = "metacopy"
+
+# Внутренние имена форматов и допустимые расширения (первое — по умолчанию).
+EXTENSIONS = {
+    "jpeg": (".jpg", ".jpeg", ".jpe"),
+    "heic": (".heic", ".heif", ".hif"),
+    "png": (".png",),
+    "webp": (".webp",),
+    "tiff": (".tif", ".tiff"),
+}
+# MIMEType из exiftool -> внутреннее имя. Чего здесь нет, то не считаем картинкой.
+# (FileType не подходит: у WEBP он бывает "Extended WEBP", "WEBP (lossless)".)
+MIME_TYPES = {
+    "image/jpeg": "jpeg", "image/heic": "heic", "image/heif": "heic", "image/png": "png",
+    "image/apng": "png", "image/webp": "webp", "image/tiff": "tiff", "image/gif": "gif",
+    "image/bmp": "bmp", "image/avif": "avif",
+}
+# Форматы, в которые exiftool умеет записывать EXIF (для --format keep).
+WRITABLE = ("jpeg", "heic", "png", "webp", "tiff")
+# Предупреждения exiftool, которые означают битый файл.
+BROKEN_RE = re.compile(r"truncat|format error|corrupt", re.IGNORECASE)
+
+# Теги, по которым строится отчёт (и проверка, что в исходнике есть что переносить).
+REPORT_TAGS = (
+    "DateTimeOriginal", "OffsetTimeOriginal",
+    "Composite:GPSLatitude", "Composite:GPSLongitude", "Composite:GPSAltitude",
+    "Make", "Model", "LensModel", "MakerNotes:all",
+)
+RESULT_TAGS = REPORT_TAGS + (
+    "IFD0:Orientation", "Composite:ImageSize", "ThumbnailImage", "PreviewImage",
+)
+
+
+class MetacopyError(Exception):
+    """Ожидаемая ошибка: печатается одной строкой, без трейсбека."""
+
+
+# ---------------------------------------------------------------- exiftool
+
+class ExifTool:
+    def __init__(self, exe: str, verbose: bool):
+        self.exe = exe
+        self.verbose = verbose
+
+    @classmethod
+    def locate(cls, verbose: bool) -> "ExifTool":
+        exe = shutil.which("exiftool")
+        if not exe:
+            if shutil.which("brew"):
+                hint = "Установите его: brew install exiftool"
+            else:
+                hint = "Установите Homebrew (https://brew.sh), а затем: brew install exiftool"
+            raise MetacopyError(f"exiftool не найден. {hint}")
+        return cls(exe, verbose)
+
+    def _run(self, args: list) -> subprocess.CompletedProcess:
+        cmd = [self.exe, *map(str, args)]
+        if self.verbose:
+            print("  $ " + shlex.join(cmd), file=sys.stderr)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise MetacopyError(f"не удалось запустить exiftool: {e.strerror}") from None
+        if self.verbose and proc.stderr.strip():
+            print("    " + proc.stderr.strip().replace("\n", "\n    "), file=sys.stderr)
+        return proc
+
+    @staticmethod
+    def _message(proc: subprocess.CompletedProcess, path: Path) -> str:
+        """Самая содержательная строка из вывода exiftool, без пути к временному файлу."""
+        lines = [l.strip() for l in (proc.stderr + proc.stdout).splitlines() if l.strip()]
+        errors = [l for l in lines if l.startswith("Error")] or lines
+        if not errors:
+            return f"exiftool завершился с кодом {proc.returncode}"
+        msg = errors[0].split(":", 1)[-1].strip() if errors[0].startswith("Error") else errors[0]
+        return msg.replace(f" - {path}", "")
+
+    def read(self, path: Path, tags) -> dict:
+        """Теги файла в виде {"Группа0:Группа1:Тег": значение}, значения без форматирования (-n)."""
+        proc = self._run(["-json", "-n", "-G0:1", *(f"-{t}" for t in tags), path])
+        try:
+            return json.loads(proc.stdout)[0]
+        except (ValueError, IndexError):
+            raise MetacopyError(f"exiftool не смог прочитать {path}: {self._message(proc, path)}") from None
+
+    def write(self, path: Path, args: list, step: str) -> None:
+        # Работаем только с временной копией, поэтому бэкап *_original не нужен.
+        proc = self._run(["-overwrite_original", "-m", "-q", *args, path])
+        if proc.returncode != 0:
+            raise MetacopyError(f"{step}: {self._message(proc, path)}")
+
+
+def pick(info: dict, name: str):
+    """Значение тега из ответа ExifTool.read по имени: "Make" или с группой "IFD0:Make"."""
+    for key, value in info.items():
+        if key == name or key.endswith(":" + name):
+            return value
+    return None
+
+
+# ---------------------------------------------------------------- шаги обработки
+
+def probe(et: ExifTool, path: Path, role: str, tags=()) -> tuple:
+    """Проверяет, что файл существует и читается. Возвращает (формат или None, теги)."""
+    if not path.exists():
+        raise MetacopyError(f"{role} не найден: {path}")
+    if not path.is_file():
+        raise MetacopyError(f"{role} — не файл: {path}")
+    if not os.access(path, os.R_OK):
+        raise MetacopyError(f"нет прав на чтение ({role}): {path}")
+    if path.stat().st_size == 0:
+        raise MetacopyError(f"{role} пустой (0 байт): {path}")
+    info = et.read(path, ("File:FileType", "File:MIMEType", "ExifTool:Error", "ExifTool:Warning", *tags))
+    error = pick(info, "ExifTool:Error")
+    if error:
+        raise MetacopyError(f"{role} не читается ({error}): {path}")
+    file_type = pick(info, "File:FileType")
+    if not file_type:
+        raise MetacopyError(f"{role}: неизвестный формат файла: {path}")
+    return MIME_TYPES.get(str(pick(info, "File:MIMEType"))), info
+
+
+def choose_format(kind: str, fmt: str) -> str:
+    if fmt == "keep":
+        if kind not in WRITABLE:
+            raise MetacopyError(
+                f"exiftool не умеет записывать EXIF в {kind.upper()}; уберите --format keep"
+            )
+        return kind
+    if fmt == "jpg":
+        return "jpeg"
+    if fmt == "heic":
+        return "heic"
+    # auto: JPEG и HEIC оставляем, остальное (PNG, WEBP, ...) — в JPEG:
+    # Фото на macOS/iOS плохо читают EXIF из PNG и WEBP.
+    return kind if kind in ("jpeg", "heic") else "jpeg"
+
+
+def output_path(target: Path, kind: str, out_kind: str, output: str | None, force: bool) -> Path:
+    if out_kind == kind and target.suffix.lower() in EXTENSIONS[out_kind]:
+        ext = target.suffix  # сохраняем написание: .JPG, .jpeg ...
+    else:
+        ext = EXTENSIONS[out_kind][0]
+    default_name = f"{target.stem}_meta{ext}"
+
+    if output is None:
+        out = target.with_name(default_name)
+    else:
+        out = Path(output).expanduser()
+        if output.endswith(("/", os.sep)) or out.is_dir():
+            out.mkdir(parents=True, exist_ok=True)
+            out = out / default_name
+        elif not out.suffix:
+            out = out.with_name(out.name + EXTENSIONS[out_kind][0])
+        elif out.suffix.lower() not in EXTENSIONS[out_kind]:
+            raise MetacopyError(
+                f"расширение {out.suffix} не подходит для {out_kind.upper()}: "
+                f"используйте {' / '.join(EXTENSIONS[out_kind])} или задайте нужный --format"
+            )
+    if not out.parent.is_dir():
+        raise MetacopyError(f"папка для результата не существует: {out.parent}")
+    if out.exists() and not force:
+        raise MetacopyError(f"файл уже существует: {out} (--force перезапишет его)")
+    return out
+
+
+def convert(src: Path, dst: Path, kind: str, quality: int, verbose: bool) -> None:
+    """Перекодирует картинку в JPEG или HEIC: через sips, а без него — через Pillow."""
+    sips = shutil.which("sips")
+    if sips:
+        cmd = [sips, "-s", "format", kind, "-s", "formatOptions", str(quality), str(src), "--out", str(dst)]
+        if verbose:
+            print("  $ " + shlex.join(cmd), file=sys.stderr)
+        proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0 or not dst.is_file() or dst.stat().st_size == 0:
+            lines = [l.strip() for l in (proc.stderr + proc.stdout).splitlines() if "rror" in l]
+            reason = lines[0] if lines else f"код {proc.returncode}"
+            raise MetacopyError(f"sips не смог сконвертировать {src.name} в {kind.upper()}: {reason}")
+        return
+
+    if kind != "jpeg":
+        raise MetacopyError("конвертация в HEIC возможна только через sips (есть в macOS)")
+    try:
+        from PIL import Image
+    except ImportError:
+        raise MetacopyError(
+            "для конвертации нужен sips (входит в macOS) или Pillow: pip3 install Pillow"
+        ) from None
+    try:
+        with Image.open(src) as im:
+            icc = im.info.get("icc_profile")
+            if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+                # Прозрачность кладём на белый фон, как это делает sips.
+                rgba = im.convert("RGBA")
+                rgb = Image.new("RGB", rgba.size, (255, 255, 255))
+                rgb.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                rgb = im.convert("RGB")
+            extra = {"icc_profile": icc} if icc else {}
+            rgb.save(dst, "JPEG", quality=quality, **extra)
+    except (OSError, ValueError) as e:
+        raise MetacopyError(f"Pillow не смог сконвертировать {src.name}: {e}") from None
+
+
+def fix_tags(et: ExifTool, path: Path, width: int, height: int, color_space: int) -> None:
+    """Правит теги, которые после копирования описывают исходник, а не эту картинку."""
+    # Эти теги есть не всегда; -wm w обновляет только существующие и не создаёт новых.
+    et.write(path, [
+        "-wm", "w",
+        f"-IFD0:ImageWidth={width}", f"-IFD0:ImageHeight={height}",
+        f"-XMP-tiff:ImageWidth={width}", f"-XMP-tiff:ImageHeight={height}",
+        f"-XMP-exif:ExifImageWidth={width}", f"-XMP-exif:ExifImageHeight={height}",
+        "-XMP-tiff:Orientation#=1",
+    ], "исправление тегов XMP")
+
+    args = [
+        # Пиксели уже повёрнуты правильно; ориентация исходника положила бы картинку набок.
+        "-IFD0:Orientation#=1",
+        f"-ExifIFD:ExifImageWidth={width}", f"-ExifIFD:ExifImageHeight={height}",
+        # Встроенные превью показывали бы старую фотографию.
+        "-IFD1:all=", "-ThumbnailImage=", "-PreviewImage=",
+        # Из нескольких перенаправлений побеждает последнее существующее:
+        # SubSecDateTimeOriginal содержит часовой пояс из OffsetTimeOriginal.
+        "-FileModifyDate<CreateDate",
+        "-FileModifyDate<DateTimeOriginal",
+        "-FileModifyDate<SubSecDateTimeOriginal",
+        f"-ExifIFD:ColorSpace#={color_space}",
+    ]
+    et.write(path, args, "исправление тегов")
+
+
+def same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve() or (a.exists() and b.exists() and os.path.samefile(a, b))
+    except OSError:
+        return False
+
+
+def process_pair(et: ExifTool, source: Path, target: Path, output: str | None, opts,
+                 produced: set) -> None:
+    try:
+        _process_pair(et, source, target, output, opts, produced)
+    except OSError as e:
+        where = f": {e.filename}" if e.filename else ""
+        raise MetacopyError(f"{e.strerror or e}{where}") from None
+
+
+def _process_pair(et, source, target, output, opts, produced):
+    if same_file(source, target):
+        raise MetacopyError("source и target — один и тот же файл")
+
+    _, src_info = probe(et, source, "исходник", REPORT_TAGS + ("ICC_Profile:ProfileDescription",))
+    if not any(describe(src_info).values()):
+        raise MetacopyError(
+            f"в исходнике нет ни даты съёмки, ни GPS, ни данных камеры — нечего переносить: {source}"
+        )
+
+    kind, tgt_info = probe(et, target, "целевой файл", ("Orientation",))
+    if kind is None:
+        file_type = pick(tgt_info, "File:FileType")
+        raise MetacopyError(f"целевой файл не похож на картинку (тип {file_type}): {target}")
+    warning = pick(tgt_info, "ExifTool:Warning")
+    if warning and BROKEN_RE.search(str(warning)):
+        raise MetacopyError(f"целевой файл повреждён ({warning}): {target}")
+
+    out_kind = choose_format(kind, opts.format)
+    out = output_path(target, kind, out_kind, output, opts.force)
+    if same_file(out, source) or same_file(out, target):
+        raise MetacopyError(f"результат перезаписал бы оригинал: {out}")
+    if out.resolve() in produced:
+        raise MetacopyError(f"{out} уже создан в этом запуске — укажите другой путь")
+
+    notes = []
+    orientation = pick(tgt_info, "Orientation")
+    if orientation not in (None, 1):
+        notes.append(
+            f"у целевого файла было Orientation={orientation}, теперь 1. "
+            "Если картинка легла набок, значит её пиксели не были повёрнуты"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="metacopy-") as tmp:
+        work = Path(tmp) / ("work" + EXTENSIONS[out_kind][0])
+        if out_kind == kind:
+            shutil.copyfile(target, work)
+        else:
+            convert(target, work, out_kind, opts.quality, opts.verbose)
+
+        # Чистим всё, кроме ICC: профиль описывает пиксели именно этой картинки.
+        et.write(work, ["-all=", "--ICC_Profile:all"], "очистка метаданных целевого файла")
+
+        # Размер меряем до копирования, пока в файле нет чужих ImageWidth/ImageHeight.
+        info = et.read(work, ("Composite:ImageSize",))
+        try:
+            width, height = (int(float(v)) for v in str(pick(info, "ImageSize")).split())
+        except ValueError:
+            raise MetacopyError(f"не удалось определить размер картинки: {target}") from None
+
+        copy_args = ["-TagsFromFile", source, "-all:all", "-unsafe"]
+        if opts.copy_icc:
+            copy_args.append("-ICC_Profile")
+        et.write(work, copy_args, "копирование метаданных")
+
+        # ColorSpace исходника (у iPhone это Display P3 = Uncalibrated) может не совпадать
+        # с профилем, который реально лежит в файле. По EXIF: 1 = sRGB, 65535 = другой (см. ICC).
+        profile = str(pick(et.read(work, ("ICC_Profile:ProfileDescription",)), "ProfileDescription") or "")
+        color_space = 1 if not profile or "srgb" in profile.lower() else 65535
+        src_profile = pick(src_info, "ProfileDescription")
+        if opts.copy_icc and src_profile and profile != str(src_profile):
+            notes.append(
+                f"ICC-профиль исходника ({src_profile}) не записался в {out_kind.upper()}, "
+                f"цвета будут как у target"
+            )
+        fix_tags(et, work, width, height, color_space)
+
+        # shutil.move сохраняет mtime, выставленный exiftool.
+        shutil.move(str(work), str(out))
+    produced.add(out.resolve())
+
+    out_info = et.read(out, RESULT_TAGS)
+    print_report(source, target, out, out_kind, src_info, out_info, notes)
+
+
+# ---------------------------------------------------------------- отчёт
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def describe(info: dict) -> dict:
+    """Ключевые теги в человекочитаемом виде: {подпись: строка или None}."""
+    date = pick(info, "DateTimeOriginal")
+    if date:
+        date = re.sub(r"^(\d{4}):(\d\d):(\d\d)", r"\1-\2-\3", str(date))
+        offset = pick(info, "OffsetTimeOriginal")
+        if offset:
+            date += f" {offset}"
+
+    gps = None
+    lat, lon = pick(info, "Composite:GPSLatitude"), pick(info, "Composite:GPSLongitude")
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+        gps = f"{lat:.6f}, {lon:.6f}"
+        alt = pick(info, "Composite:GPSAltitude")
+        if isinstance(alt, (int, float)):
+            gps += f", высота {alt:.0f} м"
+
+    make, model = (str(v).strip() for v in (pick(info, "Make") or "", pick(info, "Model") or ""))
+    if model.lower().startswith(make.lower()):
+        make = ""  # "Canon" + "Canon EOS R6" -> без повтора
+    camera = " ".join(filter(None, (make, model))) or None
+
+    makernotes = None
+    vendors = [k.split(":")[1] for k in info if k.startswith("MakerNotes:")]
+    if vendors:
+        n = len(vendors)
+        makernotes = f"{vendors[0]}, {n} {plural(n, 'тег', 'тега', 'тегов')}"
+
+    lens = pick(info, "LensModel")
+    return {
+        "Дата съёмки": date,
+        "GPS": gps,
+        "Камера": camera,
+        "Объектив": str(lens) if lens else None,
+        "MakerNotes": makernotes,
+    }
+
+
+def print_report(source, target, out, out_kind, src_info, out_info, notes) -> None:
+    src, res = describe(src_info), describe(out_info)
+    lines = [f"✓ {source.name} → {target.name}"]
+    for label, value in res.items():
+        if value:
+            text = value
+        elif src[label]:
+            text = "✗ не перенеслось"
+        else:
+            text = "— нет в исходнике"
+        lines.append(f"  {label:<12} {text}")
+
+    width, height = str(pick(out_info, "ImageSize") or "? ?").split()[:2]
+    orientation = pick(out_info, "IFD0:Orientation")
+    has_preview = pick(out_info, "ThumbnailImage") or pick(out_info, "PreviewImage")
+    lines.append(
+        f"  {'Картинка':<12} {width}×{height} {out_kind.upper()}, Orientation={orientation}, "
+        + ("превью осталось!" if has_preview else "без превью")
+    )
+    lines.append(f"  {'Сохранено':<12} {os.path.abspath(out)}")
+
+    if not res["Дата съёмки"]:
+        notes.append("даты съёмки нет, поэтому дата изменения файла не выставлена")
+    lines += [f"  ! {n}" for n in notes]
+    print("\n".join(lines), flush=True)
+
+
+# ---------------------------------------------------------------- пакетный режим
+
+def parse_csv(text: str) -> list:
+    """Строки CSV -> [(номер строки, [поля])]. Пустые строки и строки с # пропускаются."""
+    lines = text.splitlines()
+    data = [l for l in lines if l.strip() and not l.lstrip().startswith("#")]
+    first = data[0] if data else ""
+    # Excel с русской локалью сохраняет CSV через точку с запятой.
+    if ";" in first and "," not in first:
+        delimiter = ";"
+    elif "\t" in first and "," not in first:
+        delimiter = "\t"
+    else:
+        delimiter = ","
+
+    rows = []
+    for lineno, row in enumerate(csv.reader(lines, delimiter=delimiter), 1):
+        cells = [c.strip() for c in row]
+        if not any(cells) or cells[0].startswith("#"):
+            continue
+        if not rows and cells[0].lower() == "source":
+            continue  # заголовок
+        rows.append((lineno, cells))
+    return rows
+
+
+def run_batch(et: ExifTool, opts) -> int:
+    csv_path = Path(opts.batch).expanduser()
+    if not csv_path.is_file():
+        raise MetacopyError(f"CSV не найден: {csv_path}")
+    try:
+        rows = parse_csv(csv_path.read_text(encoding="utf-8-sig"))
+    except UnicodeDecodeError:
+        raise MetacopyError(f"{csv_path}: CSV должен быть в кодировке UTF-8") from None
+    if not rows:
+        raise MetacopyError(f"{csv_path}: нет ни одной пары source,target")
+
+    out_dir = None
+    if opts.output:
+        out_dir = Path(opts.output).expanduser()
+        if out_dir.exists() and not out_dir.is_dir():
+            raise MetacopyError(f"в режиме --batch -o должен быть папкой: {out_dir}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Относительные пути в CSV считаются от папки, где лежит сам CSV.
+    def resolve(cell: str) -> Path:
+        path = Path(cell).expanduser()
+        return path if path.is_absolute() else csv_path.parent / path
+
+    produced, failed = set(), 0
+    for i, (lineno, cells) in enumerate(rows):
+        if i:
+            print(flush=True)
+        try:
+            if len(cells) < 2 or not cells[0] or not cells[1]:
+                raise MetacopyError("нужно два поля: source,target[,output]")
+            if len(cells) > 3:
+                raise MetacopyError(f"лишние поля ({len(cells)}); пути с запятыми возьмите в кавычки")
+            if len(cells) == 3 and cells[2]:
+                output = str(resolve(cells[2])) + (os.sep if cells[2].endswith("/") else "")
+            elif out_dir:
+                output = str(out_dir) + os.sep
+            else:
+                output = None
+            process_pair(et, resolve(cells[0]), resolve(cells[1]), output, opts, produced)
+        except MetacopyError as e:
+            failed += 1
+            print(f"✗ строка {lineno}: {e}", file=sys.stderr, flush=True)
+
+    total = len(rows)
+    summary = f"\nГотово: {total - failed} из {total}"
+    print(summary + (f", ошибок: {failed}" if failed else ""), flush=True)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------- CLI
+
+EPILOG = """\
+примеры:
+  metacopy IMG_1234.HEIC ai.png                  -> ai_meta.jpg рядом с ai.png
+  metacopy IMG_1234.HEIC ai.png -o ~/Desktop/    -> ~/Desktop/ai_meta.jpg
+  metacopy IMG_1234.HEIC ai.webp --format keep   -> ai_meta.webp
+  metacopy --batch pairs.csv -o done/            -> все пары из CSV в папку done/
+
+формат CSV: в каждой строке source,target[,output]; относительные пути
+считаются от папки с CSV; строки с # и заголовок "source,target" пропускаются.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        usage="%(prog)s <source> <target> [-o OUTPUT] [--format auto|jpg|heic|keep] [опции]\n"
+              "       %(prog)s --batch pairs.csv [-o DIR] [опции]",
+        description="Переносит метаданные (дату съёмки, GPS, камеру, объектив, Apple MakerNotes) "
+                    "с исходной фотографии на обработанную или сгенерированную картинку.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,
+    )
+    p.add_argument("source", nargs="?", help="исходная фотография с метаданными (HEIC, JPEG, ...)")
+    p.add_argument("target", nargs="?", help="картинка, которой нужны метаданные (PNG, JPEG, WEBP, ...)")
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="файл или папка для результата (по умолчанию <target>_meta.jpg рядом с target); "
+                        "с --batch — папка")
+    p.add_argument("--format", choices=("auto", "jpg", "jpeg", "heic", "keep"), default="auto",
+                   help="формат результата: auto (по умолчанию) — PNG/WEBP и прочее в JPEG, "
+                        "JPEG и HEIC как есть; jpg — всегда JPEG; heic — всегда HEIC; "
+                        "keep — без конвертации")
+    p.add_argument("--quality", type=int, default=95, metavar="N",
+                   help="качество JPEG/HEIC при конвертации, 1-100 (по умолчанию 95)")
+    p.add_argument("--copy-icc", action="store_true",
+                   help="перенести и ICC-профиль исходника (по умолчанию остаётся профиль target)")
+    p.add_argument("-f", "--force", action="store_true", help="перезаписать результат, если он уже есть")
+    p.add_argument("--batch", metavar="CSV", help="пакетный режим: пары source,target из CSV")
+    p.add_argument("-v", "--verbose", action="store_true", help="показывать команды exiftool и sips")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
+                   help="показать версию")
+    p.add_argument("-h", "--help", action="help", help="показать эту справку")
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    opts = parser.parse_args(argv)
+    if opts.format == "jpeg":
+        opts.format = "jpg"
+    if opts.batch and (opts.source or opts.target):
+        parser.error("с --batch пути source и target берутся из CSV")
+    if not opts.batch and not (opts.source and opts.target):
+        parser.error("укажите source и target (или --batch pairs.csv)")
+    if not 1 <= opts.quality <= 100:
+        parser.error("--quality должно быть от 1 до 100")
+
+    try:
+        et = ExifTool.locate(opts.verbose)
+        if opts.batch:
+            return run_batch(et, opts)
+        source, target = Path(opts.source).expanduser(), Path(opts.target).expanduser()
+        process_pair(et, source, target, opts.output, opts, set())
+        return 0
+    except MetacopyError as e:
+        print(f"{PROG}: ошибка: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(f"\n{PROG}: прервано", file=sys.stderr)
+        return 130
+    except Exception as e:  # ошибка в самом metacopy: коротко, трейсбек только с -v
+        if opts.verbose:
+            traceback.print_exc()
+        print(f"{PROG}: непредвиденная ошибка: {e!r} (подробности: --verbose)", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
